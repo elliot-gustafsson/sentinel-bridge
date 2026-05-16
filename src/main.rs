@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ProxyState {
@@ -79,72 +80,128 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&bind_addr).await?;
     println!("ready to accept connections on {}", bind_addr);
 
+    let shutdown_token = CancellationToken::new();
+    let signal_token = shutdown_token.clone();
+
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        #[cfg(unix)]
+        let mut sigquit =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit()).unwrap();
+        #[cfg(unix)]
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+
+        tokio::select! {
+            _ = async {
+                #[cfg(unix)]
+                sigint.recv().await;
+                #[cfg(not(unix))]
+                tokio::signal::ctrl_c().await.unwrap();
+            } => {},
+            _ = async {
+                #[cfg(unix)]
+                sigquit.recv().await;
+            } => {},
+            _ = async {
+                #[cfg(unix)]
+                sigterm.recv().await;
+            } => {},
+        }
+
+        println!("received termination signal");
+        println!("sleeping for 5s...");
+
+        sleep(Duration::from_secs(5)).await;
+
+        println!("starting shutdown...");
+        signal_token.cancel();
+    });
+
+    let mut connection_tasks = JoinSet::new();
+
     loop {
-        let (mut client_stream, _) = match listener.accept().await {
-            Ok(val) => val,
-            Err(e) => {
-                eprintln!("failed to accept connection: {}", e);
-                continue;
-            }
-        };
-
-        let mut current_state_rx = state_rx.clone();
-
-        tokio::spawn(async move {
-            // hang incoming connections until the proxy is Active
-            let master_addr = loop {
-                let state = *current_state_rx.borrow();
-                match state {
-                    ProxyState::Active(addr) => break addr,
-                    ProxyState::Paused => {
-                        if current_state_rx.changed().await.is_err() {
-                            return;
-                        }
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (mut client_stream, _) = match accept_result {
+                    Ok(val) => val,
+                    Err(e) => {
+                        eprintln!("failed to accept connection: {}", e);
+                        continue;
                     }
-                }
-            };
+                };
 
-            // connect to the backend master
-            match TcpStream::connect(master_addr).await {
-                Ok(mut backend_stream) => {
-                    let _ = client_stream.set_nodelay(true);
-                    let _ = backend_stream.set_nodelay(true);
+                let mut current_state_rx = state_rx.clone();
+                let conn_token = shutdown_token.clone();
 
-                    let invalidation_trigger = async {
-                        let mut rx = current_state_rx.clone();
-                        loop {
-                            if rx.changed().await.is_err() {
-                                break;
-                            }
-
-                            let state = *rx.borrow();
-                            let should_drain = match state {
-                                ProxyState::Paused => true, // +new-epoch hit quorum
-                                ProxyState::Active(new_addr) if new_addr != master_addr => true,
-                                _ => false,
-                            };
-
-                            if should_drain {
-                                // election event detected
-                                sleep(Duration::from_millis(100)).await;
-                                break; // exit and drop sockets
+                connection_tasks.spawn(async move {
+                    let master_addr = loop {
+                        let state = *current_state_rx.borrow();
+                        match state {
+                            ProxyState::Active(addr) => break addr,
+                            ProxyState::Paused => {
+                                if current_state_rx.changed().await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     };
 
-                    tokio::select! {
-                        res = copy_bidirectional(&mut client_stream, &mut backend_stream) => {
-                            if let Err(e) = res {
-                                if e.kind() != std::io::ErrorKind::ConnectionReset {}
+                    match TcpStream::connect(master_addr).await {
+                        Ok(mut backend_stream) => {
+                            let _ = client_stream.set_nodelay(true);
+                            let _ = backend_stream.set_nodelay(true);
+
+                            let invalidation_trigger = async {
+                                let mut rx = current_state_rx.clone();
+                                loop {
+                                    if rx.changed().await.is_err() {
+                                        break;
+                                    }
+
+                                    let state = *rx.borrow();
+                                    let should_drain = match state {
+                                        ProxyState::Paused => true,
+                                        ProxyState::Active(new_addr) if new_addr != master_addr => true,
+                                        _ => false,
+                                    };
+
+                                    if should_drain {
+                                        sleep(Duration::from_millis(100)).await;
+                                        break;
+                                    }
+                                }
+                            };
+
+                            tokio::select! {
+                                res = copy_bidirectional(&mut client_stream, &mut backend_stream) => {
+                                    if let Err(e) = res {
+                                        if e.kind() != std::io::ErrorKind::ConnectionReset {}
+                                    }
+                                }
+                                _ = invalidation_trigger => {}
+                                _ = conn_token.cancelled() => {}
                             }
                         }
-                        _ = invalidation_trigger => {}
+                        Err(e) => eprintln!("failed to connect to backend {}: {}", master_addr, e),
                     }
-                }
-                Err(e) => eprintln!("failed to connect to backend {}: {}", master_addr, e),
+                });
             }
-        });
+
+            _ = shutdown_token.cancelled() => {
+                println!("stopped accepting new connections.");
+                break;
+            }
+        }
     }
+
+    println!("waiting for active connections to drain...");
+    while let Some(_) = connection_tasks.join_next().await {}
+
+    println!("shutting down, bye bye!");
+    Ok(())
 }
 
 /// Concurrently queries all Sentinels and waits until a strict majority agree on the master.
