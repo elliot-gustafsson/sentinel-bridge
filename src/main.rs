@@ -1,3 +1,5 @@
+use fred::prelude::*;
+use fred::types::RedisConfig;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
@@ -6,7 +8,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
-use tokio_stream::StreamExt;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ProxyState {
@@ -96,7 +97,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match state {
                     ProxyState::Active(addr) => break addr,
                     ProxyState::Paused => {
-                        // Await state change without consuming CPU
                         if current_state_rx.changed().await.is_err() {
                             return;
                         }
@@ -192,15 +192,22 @@ async fn bootstrap_single_master(
     sentinel_url: &str,
     master_name: &str,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let client = redis::Client::open(sentinel_url)?;
-    // let mut conn = client.get_async_connection().await?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
+    let config = RedisConfig::from_url(sentinel_url)?;
+    let client = Builder::from_config(config).build()?;
+    client.init().await?;
 
-    let addr_parts: Vec<String> = redis::cmd("SENTINEL")
-        .arg("get-master-addr-by-name")
-        .arg(master_name)
-        .query_async(&mut conn)
+    let addr_parts: Vec<String> = client
+        .custom(
+            fred::types::CustomCommand::new_static(
+                "SENTINEL",
+                fred::types::ClusterHash::Random,
+                false,
+            ),
+            vec!["get-master-addr-by-name", master_name],
+        )
         .await?;
+
+    let _ = client.quit().await;
 
     if addr_parts.len() == 2 {
         let addr: SocketAddr = format!("{}:{}", addr_parts[0], addr_parts[1]).parse()?;
@@ -261,7 +268,6 @@ async fn run_quorum_coordinator(
     }
 }
 
-/// Connects to a specific Sentinel and streams events into the MPSC channel.
 async fn run_sentinel_subscriber(
     id: usize,
     url: String,
@@ -269,38 +275,43 @@ async fn run_sentinel_subscriber(
     tx: mpsc::Sender<SentinelEvent>,
 ) {
     loop {
-        let client = match redis::Client::open(url.as_str()) {
+        let config = match RedisConfig::from_url(&url) {
             Ok(c) => c,
-            Err(_) => {
-                sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-
-        let mut pubsub_conn = match client.get_async_pubsub().await {
-            Ok(conn) => conn,
             Err(e) => {
-                eprintln!("sentinel[{}] get_async_pubsub err: {}", id, e);
+                eprintln!("sentinel[{}] error creating config: {}", id, e);
                 sleep(Duration::from_secs(2)).await;
                 continue;
             }
         };
 
-        if let Err(e) = pubsub_conn
-            .subscribe(&["+new-epoch", "+switch-master"])
-            .await
-        {
-            eprintln!("sentinel[{}] subscribe err: {}", id, e);
+        let client = match Builder::from_config(config).build_subscriber_client() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("sentinel[{}] error creating client: {}", id, e);
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        if let Err(e) = client.init().await {
+            eprintln!("sentinel[{}] connection failed: {}", id, e);
             sleep(Duration::from_secs(2)).await;
             continue;
         }
 
-        let mut stream = pubsub_conn.on_message();
+        if let Err(e) = client.subscribe(vec!["+new-epoch", "+switch-master"]).await {
+            eprintln!("sentinel[{}] subscribe err: {}", id, e);
+            let _ = client.quit().await;
+            sleep(Duration::from_secs(2)).await;
+            continue;
+        }
 
-        while let Some(msg) = stream.next().await {
-            let channel = msg.get_channel_name();
+        let mut message_stream = client.message_rx();
 
-            if let Ok(payload) = msg.get_payload::<String>() {
+        while let Ok(msg) = message_stream.recv().await {
+            let channel = msg.channel.to_string();
+
+            if let Some(payload) = msg.value.as_string() {
                 if channel == "+new-epoch" {
                     if let Ok(epoch) = payload.trim().parse::<u64>() {
                         let _ = tx
@@ -331,6 +342,7 @@ async fn run_sentinel_subscriber(
         }
 
         eprintln!("sentinel[{}] disconnected, reconnecting...", id);
+        let _ = client.quit().await;
         sleep(Duration::from_secs(2)).await;
     }
 }
