@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown_token = CancellationToken::new();
 
-    tokio::spawn(wait_for_shutdown(shutdown_token.clone()));
+    tokio::spawn(wait_for_shutdown(shutdown_token.clone(), ready));
 
     let mut connection_tasks = JoinSet::new();
 
@@ -182,7 +182,7 @@ async fn metrics_handler(State(state): State<AppState>) -> String {
     state.prom_handler.render()
 }
 
-async fn wait_for_shutdown(token: CancellationToken) {
+async fn wait_for_shutdown(token: CancellationToken, ready: Arc<AtomicBool>) {
     let mut sigint =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
 
@@ -204,6 +204,8 @@ async fn wait_for_shutdown(token: CancellationToken) {
     }
 
     info!("received termination signal");
+    ready.store(false, Ordering::Relaxed);
+
     info!("sleeping for 5s...");
 
     sleep(Duration::from_secs(5)).await;
