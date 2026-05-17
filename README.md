@@ -1,2 +1,60 @@
-# sentinel-bridge
-Sentinel-aware TCP proxy for Redis/Valkey clients that don't speak Sentinel.
+# Sentinel Bridge
+
+Sentinel Bridge is an intelligent, quorum-aware TCP proxy designed to sit between client applications and a Valkey/Redis Sentinel cluster.
+
+It abstracts Sentinel failover logic away from the client. Clients connect to the proxy via a standard TCP connection, and the proxy autonomously discovers the current master database, routes traffic to it, and gracefully manages connections during cluster failovers.
+
+## Architecture and Behavior
+1. **Quorum Bootstrapping**: On startup, the proxy queries all configured Sentinels simultaneously. It will not begin accepting client traffic until a strict majority (quorum) of Sentinels agree on the current master address.
+2. **Event Monitoring**: The proxy establishes persistent `Pub/Sub` connections (using the `fred` crate) to all Sentinels. It actively listens for `+switch-master` events.
+3. **Data Plane**: Client connections are streamed directly to the current master using `tokio::io::copy_bidirectional` for high-throughput, low-latency communication.
+4. **Failover Invalidation**: When a quorum of Sentinels report a `+switch-master` event (indicating a new master has been elected), the Quorum Coordinator updates the active backend route. The proxy immediately severs all active client connections routed to the old master, forcing clients to reconnect.
+5. **Traffic Resumption**: As soon as clients reconnect, their new TCP streams are automatically routed to the newly promoted master.
+
+## Configuration
+The application is configured entirely via environment variables.
+| Variable | Description | Default | Example |
+| :--- | :--- | :--- | :--- |
+| `PROXY_BIND_ADDR` | The `IP:PORT` the proxy listens on for client TCP traffic. | `0.0.0.0:6379` | `0.0.0.0:6379` |
+| `HTTP_BIND_ADDR` | The `IP:PORT` for the HTTP server (Readiness probes and Metrics). | `0.0.0.0:8080` | `0.0.0.0:8080` |
+| `MASTER_NAME` | The name of the Valkey/Redis master group monitored by Sentinel. | (Required) | `mymaster` |
+| `SENTINEL_ADDRS` | A comma-separated list of Sentinel connection URLs. | (Required) | `redis://10.0.0.1:26379,redis://10.0.0.2:26379` |
+
+## Observability
+
+### Logging
+The application uses the `tracing` ecosystem. Logs are output as structured JSON to `stdout`.
+Log levels can be configured using the `RUST_LOG` environment variable (e.g., `RUST_LOG=sentinel_bridge=debug,error`). By default, internal application logic logs at `INFO`, while dependencies are silenced below `ERROR`.
+
+### Metrics and Readiness
+The proxy exposes an HTTP server on `HTTP_BIND_ADDR` with two endpoints:
+* `/ready`: Returns HTTP 200 `OK` only when the proxy has successfully bootstrapped quorum and is actively routing traffic. Returns HTTP 503 otherwise.
+* `/health`: A basic liveness probe.
+* `/metrics`: Exposes Prometheus-formatted metrics.
+
+**Available Prometheus Metrics:**
+* `sentinel_bridge_connections_total` (Counter): Total number of client TCP connections accepted, labeled by `backend` IP.
+* `sentinel_bridge_active_connections` (Gauge): Current number of active TCP connections, labeled by `backend` IP.
+* `sentinel_bridge_connection_ends_total` (Counter): Total number of closed connections, labeled by `backend` IP and `reason` (`client_disconnect`, `failover_severed`, `graceful_shutdown`, `backend_connect_failed`).
+* `sentinel_bridge_failovers_total` (Counter): Total number of successful cluster failovers detected and processed.
+*Note: The metrics registry utilizes an autonomous upkeep mechanism with a 600-second idle timeout to prevent memory leaks from stale high-cardinality labels.*
+
+## Graceful Shutdown
+The application intercepts `SIGINT`, `SIGTERM`, and `SIGQUIT` signals.
+To support zero-downtime deployments in Kubernetes environments, the shutdown sequence executes as follows:
+1. Receives termination signal.
+2. Sleeps for 5 seconds to allow upstream LoadBalancers/kube-proxy to remove the pod IP.
+3. Stops accepting new incoming TCP connections.
+4. Waits indefinitely for all currently active streams to finish data transfer and close cleanly.
+
+## Building and Running
+The project requires Rust to build. Dependencies are managed via Cargo.
+```bash
+# Build the optimized release binary
+make build
+
+# Run locally
+make localrun
+
+# A multistage `Containerfile` is provided to build the application into a minimal, `distroless` Debian image.
+make container TAG=myregistry/sentinel-bridge:latest
