@@ -10,27 +10,15 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ProxyState {
-    Paused,
-    Active(SocketAddr),
-}
-
 #[derive(Debug)]
-enum SentinelEvent {
-    NewEpoch {
-        sentinel_id: usize,
-        epoch: u64,
-    },
-    SwitchMaster {
-        sentinel_id: usize,
-        new_addr: SocketAddr,
-    },
+struct SwitchMasterEvent {
+    sentinel_id: usize,
+    new_addr: SocketAddr,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bind_addr = env::var("PROXY_BIND_ADDR").unwrap_or("127.0.0.1:8080".to_string());
+    let bind_addr = env::var("PROXY_BIND_ADDR").unwrap_or("127.0.0.1:6379".to_string());
 
     let master_name = env::var("MASTER_NAME")
         .map_err(|_| "FATAL: MASTER_NAME environment variable is missing")?;
@@ -60,72 +48,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verified_master = bootstrap_quorum_master(&sentinels, &master_name, quorum_size).await;
     println!("bootstrapped current master: {}", verified_master);
 
-    let initial_state = ProxyState::Active(verified_master);
+    let (event_tx, event_rx) = mpsc::channel::<SwitchMasterEvent>(100);
+    let (state_tx, state_rx) = watch::channel(verified_master);
 
-    let (event_tx, event_rx) = mpsc::channel::<SentinelEvent>(100);
-    let (state_tx, state_rx) = watch::channel(initial_state);
-
-    for (id, url) in sentinels.into_iter().enumerate() {
+    for (id, url) in sentinels.iter().enumerate() {
         let tx = event_tx.clone();
         let name = master_name.clone();
-        tokio::spawn(async move {
-            run_sentinel_subscriber(id, url, name, tx).await;
-        });
+        tokio::spawn(run_sentinel_subscriber(id, url.to_owned(), name, tx));
     }
 
-    tokio::spawn(async move {
-        run_quorum_coordinator(quorum_size, event_rx, state_tx).await;
-    });
+    tokio::spawn(run_quorum_coordinator(quorum_size, event_rx, state_tx));
 
     let listener = TcpListener::bind(&bind_addr).await?;
     println!("ready to accept connections on {}", bind_addr);
 
     let shutdown_token = CancellationToken::new();
-    let signal_token = shutdown_token.clone();
 
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        let mut sigint =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-        #[cfg(unix)]
-        let mut sigquit =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit()).unwrap();
-        #[cfg(unix)]
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-
-        tokio::select! {
-            _ = async {
-                #[cfg(unix)]
-                sigint.recv().await;
-                #[cfg(not(unix))]
-                tokio::signal::ctrl_c().await.unwrap();
-            } => {},
-            _ = async {
-                #[cfg(unix)]
-                sigquit.recv().await;
-            } => {},
-            _ = async {
-                #[cfg(unix)]
-                sigterm.recv().await;
-            } => {},
-        }
-
-        println!("received termination signal");
-        println!("sleeping for 5s...");
-
-        sleep(Duration::from_secs(5)).await;
-
-        println!("starting shutdown...");
-        signal_token.cancel();
-    });
+    tokio::spawn(wait_for_shutdown(shutdown_token.clone()));
 
     let mut connection_tasks = JoinSet::new();
 
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
-                let (mut client_stream, _) = match accept_result {
+                let (client_stream, _) = match accept_result {
                     Ok(val) => val,
                     Err(e) => {
                         eprintln!("failed to accept connection: {}", e);
@@ -133,61 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                let mut current_state_rx = state_rx.clone();
-                let conn_token = shutdown_token.clone();
+                let current_state_rx = state_rx.clone();
+                let c_token = shutdown_token.clone();
 
-                connection_tasks.spawn(async move {
-                    let master_addr = loop {
-                        let state = *current_state_rx.borrow();
-                        match state {
-                            ProxyState::Active(addr) => break addr,
-                            ProxyState::Paused => {
-                                if current_state_rx.changed().await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    };
-
-                    match TcpStream::connect(master_addr).await {
-                        Ok(mut backend_stream) => {
-                            let _ = client_stream.set_nodelay(true);
-                            let _ = backend_stream.set_nodelay(true);
-
-                            let invalidation_trigger = async {
-                                let mut rx = current_state_rx.clone();
-                                loop {
-                                    if rx.changed().await.is_err() {
-                                        break;
-                                    }
-
-                                    let state = *rx.borrow();
-                                    let should_drain = match state {
-                                        ProxyState::Paused => true,
-                                        ProxyState::Active(new_addr) if new_addr != master_addr => true,
-                                        _ => false,
-                                    };
-
-                                    if should_drain {
-                                        sleep(Duration::from_millis(100)).await;
-                                        break;
-                                    }
-                                }
-                            };
-
-                            tokio::select! {
-                                res = copy_bidirectional(&mut client_stream, &mut backend_stream) => {
-                                    if let Err(e) = res {
-                                        if e.kind() != std::io::ErrorKind::ConnectionReset {}
-                                    }
-                                }
-                                _ = invalidation_trigger => {}
-                                _ = conn_token.cancelled() => {}
-                            }
-                        }
-                        Err(e) => eprintln!("failed to connect to backend {}: {}", master_addr, e),
-                    }
-                });
+                connection_tasks.spawn(handle_client_connection(c_token, client_stream, current_state_rx));
             }
 
             _ = shutdown_token.cancelled() => {
@@ -202,6 +97,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("shutting down, bye bye!");
     Ok(())
+}
+
+async fn wait_for_shutdown(token: CancellationToken) {
+    let mut sigint =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+
+    let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit()).unwrap();
+
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+
+    tokio::select! {
+        _ = async {
+            sigint.recv().await;
+        } => {},
+        _ = async {
+            sigquit.recv().await;
+        } => {},
+        _ = async {
+            sigterm.recv().await;
+        } => {},
+    }
+
+    println!("received termination signal");
+    println!("sleeping for 5s...");
+
+    sleep(Duration::from_secs(5)).await;
+
+    println!("starting shutdown...");
+    token.cancel();
+}
+
+async fn handle_client_connection(
+    c_token: CancellationToken,
+    mut client_stream: TcpStream,
+    mut state_rx: watch::Receiver<SocketAddr>,
+) {
+    let master_addr = *state_rx.borrow();
+
+    match TcpStream::connect(master_addr).await {
+        Ok(mut backend_stream) => {
+            let _ = client_stream.set_nodelay(true);
+            let _ = backend_stream.set_nodelay(true);
+
+            let invalidation_trigger = async {
+                let current_addr = *state_rx.borrow_and_update();
+                if current_addr != master_addr {
+                    return;
+                }
+
+                loop {
+                    if state_rx.changed().await.is_err() {
+                        break;
+                    }
+
+                    let new_addr = *state_rx.borrow_and_update();
+
+                    if new_addr != master_addr {
+                        break;
+                    }
+                }
+            };
+
+            tokio::select! {
+                res = copy_bidirectional(&mut client_stream, &mut backend_stream) => {
+                    if let Err(e) = res {
+                        if e.kind() != std::io::ErrorKind::ConnectionReset {}
+                    }
+                }
+                _ = invalidation_trigger => {}
+                _ = c_token.cancelled() => {}
+            }
+        }
+        Err(e) => eprintln!("failed to connect to backend {}: {}", master_addr, e),
+    }
 }
 
 /// Concurrently queries all Sentinels and waits until a strict majority agree on the master.
@@ -277,50 +247,19 @@ async fn bootstrap_single_master(
 /// Aggregates events from the Sentinel streams and enforces quorum rules.
 async fn run_quorum_coordinator(
     quorum: usize,
-    mut event_rx: mpsc::Receiver<SentinelEvent>,
-    state_tx: watch::Sender<ProxyState>,
+    mut event_rx: mpsc::Receiver<SwitchMasterEvent>,
+    state_tx: watch::Sender<SocketAddr>,
 ) {
-    let mut current_epoch: u64 = 0;
-    let mut epoch_votes: HashSet<usize> = HashSet::new();
     let mut master_votes: HashMap<SocketAddr, HashSet<usize>> = HashMap::new();
 
     while let Some(event) = event_rx.recv().await {
-        match event {
-            SentinelEvent::NewEpoch { sentinel_id, epoch } => {
-                if epoch > current_epoch {
-                    println!("epoch {} starting, clearing previous votes.", epoch);
-                    current_epoch = epoch;
-                    epoch_votes.clear();
-                    master_votes.clear();
-                }
+        let votes = master_votes.entry(event.new_addr).or_default();
+        votes.insert(event.sentinel_id);
 
-                if epoch == current_epoch {
-                    epoch_votes.insert(sentinel_id);
-                    if epoch_votes.len() >= quorum && *state_tx.borrow() != ProxyState::Paused {
-                        println!(
-                            "quorum reached for epoch {}, pausing proxy and closing active connections.",
-                            epoch
-                        );
-                        let _ = state_tx.send(ProxyState::Paused);
-                    }
-                }
-            }
-            SentinelEvent::SwitchMaster {
-                sentinel_id,
-                new_addr,
-            } => {
-                let votes = master_votes.entry(new_addr).or_default();
-                votes.insert(sentinel_id);
-
-                if votes.len() >= quorum && *state_tx.borrow() != ProxyState::Active(new_addr) {
-                    println!(
-                        "quorum reached for master {}, resuming proxy traffic.",
-                        new_addr
-                    );
-                    let _ = state_tx.send(ProxyState::Active(new_addr));
-                    master_votes.clear();
-                }
-            }
+        if votes.len() >= quorum && *state_tx.borrow() != event.new_addr {
+            println!("quorum reached for master {}.", event.new_addr);
+            let _ = state_tx.send(event.new_addr);
+            master_votes.clear();
         }
     }
 }
@@ -329,7 +268,7 @@ async fn run_sentinel_subscriber(
     id: usize,
     url: String,
     master_name: String,
-    tx: mpsc::Sender<SentinelEvent>,
+    tx: mpsc::Sender<SwitchMasterEvent>,
 ) {
     loop {
         let config = match RedisConfig::from_url(&url) {
@@ -369,17 +308,9 @@ async fn run_sentinel_subscriber(
             let channel = msg.channel.to_string();
 
             if let Some(payload) = msg.value.as_string() {
-                if channel == "+new-epoch" {
-                    if let Ok(epoch) = payload.trim().parse::<u64>() {
-                        let _ = tx
-                            .send(SentinelEvent::NewEpoch {
-                                sentinel_id: id,
-                                epoch,
-                            })
-                            .await;
-                    }
-                } else if channel == "+switch-master" {
+                if channel == "+switch-master" {
                     let parts: Vec<&str> = payload.split_whitespace().collect();
+
                     if parts.len() >= 5 && parts[0] == master_name {
                         let new_ip = parts[3];
                         let new_port = parts[4];
@@ -387,7 +318,7 @@ async fn run_sentinel_subscriber(
                             format!("{}:{}", new_ip, new_port).parse::<SocketAddr>()
                         {
                             let _ = tx
-                                .send(SentinelEvent::SwitchMaster {
+                                .send(SwitchMasterEvent {
                                     sentinel_id: id,
                                     new_addr,
                                 })
@@ -410,153 +341,74 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     #[tokio::test]
-    async fn test_coordinator_pauses_on_quorum_epoch() {
-        let dummy_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
-        let initial_state = ProxyState::Active(dummy_ip);
-
-        let (event_tx, event_rx) = mpsc::channel::<SentinelEvent>(100);
-        let (state_tx, mut state_rx) = watch::channel(initial_state);
-
-        tokio::spawn(async move {
-            run_quorum_coordinator(2, event_rx, state_tx).await;
-        });
-
-        event_tx
-            .send(SentinelEvent::NewEpoch {
-                sentinel_id: 0,
-                epoch: 5,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(*state_rx.borrow(), ProxyState::Active(dummy_ip));
-
-        event_tx
-            .send(SentinelEvent::NewEpoch {
-                sentinel_id: 1,
-                epoch: 5,
-            })
-            .await
-            .unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(1), state_rx.changed()).await;
-
-        assert!(result.is_ok(), "Coordinator failed to update state in time");
-
-        assert_eq!(*state_rx.borrow(), ProxyState::Paused);
-    }
-
-    #[tokio::test]
-    async fn test_coordinator_pauses_on_non_quorum_epoch() {
-        let dummy_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
-        let initial_state = ProxyState::Active(dummy_ip);
-
-        let (event_tx, event_rx) = mpsc::channel::<SentinelEvent>(100);
-        let (state_tx, state_rx) = watch::channel(initial_state);
-
-        tokio::spawn(async move {
-            run_quorum_coordinator(2, event_rx, state_tx).await;
-        });
-
-        event_tx
-            .send(SentinelEvent::NewEpoch {
-                sentinel_id: 0,
-                epoch: 5,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(*state_rx.borrow(), ProxyState::Active(dummy_ip));
-
-        event_tx
-            .send(SentinelEvent::NewEpoch {
-                sentinel_id: 1,
-                epoch: 6,
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            !state_rx.has_changed().unwrap(),
-            "Coordinator should not have updated the state"
-        );
-
-        assert_eq!(*state_rx.borrow(), ProxyState::Active(dummy_ip));
-    }
-
-    #[tokio::test]
     async fn test_coordinator_unpauses_on_quorum_switch_master() {
         let dummy_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
-        let initial_state = ProxyState::Paused;
-
-        let (event_tx, event_rx) = mpsc::channel::<SentinelEvent>(100);
-        let (state_tx, mut state_rx) = watch::channel(initial_state);
-
-        tokio::spawn(async move {
-            run_quorum_coordinator(2, event_rx, state_tx).await;
-        });
-
-        event_tx
-            .send(SentinelEvent::SwitchMaster {
-                sentinel_id: (0),
-                new_addr: (dummy_ip),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(*state_rx.borrow(), ProxyState::Paused);
-
-        event_tx
-            .send(SentinelEvent::SwitchMaster {
-                sentinel_id: (1),
-                new_addr: (dummy_ip),
-            })
-            .await
-            .unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(1), state_rx.changed()).await;
-
-        assert!(result.is_ok(), "Coordinator failed to update state in time");
-
-        assert_eq!(*state_rx.borrow(), ProxyState::Active(dummy_ip));
-    }
-
-    #[tokio::test]
-    async fn test_coordinator_unpauses_on_non_quorum_switch_master_ip() {
-        let dummy_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
         let dummy_ip2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 6379);
-        let initial_state = ProxyState::Paused;
 
-        let (event_tx, event_rx) = mpsc::channel::<SentinelEvent>(100);
-        let (state_tx, state_rx) = watch::channel(initial_state);
+        let (event_tx, event_rx) = mpsc::channel::<SwitchMasterEvent>(100);
+        let (state_tx, mut state_rx) = watch::channel(dummy_ip);
 
-        tokio::spawn(async move {
-            run_quorum_coordinator(2, event_rx, state_tx).await;
-        });
+        tokio::spawn(run_quorum_coordinator(2, event_rx, state_tx));
 
         event_tx
-            .send(SentinelEvent::SwitchMaster {
+            .send(SwitchMasterEvent {
                 sentinel_id: (0),
-                new_addr: (dummy_ip),
+                new_addr: (dummy_ip2),
             })
             .await
             .unwrap();
 
-        assert_eq!(*state_rx.borrow(), ProxyState::Paused);
+        assert_eq!(*state_rx.borrow(), dummy_ip);
 
         event_tx
-            .send(SentinelEvent::SwitchMaster {
+            .send(SwitchMasterEvent {
                 sentinel_id: (1),
                 new_addr: (dummy_ip2),
             })
             .await
             .unwrap();
 
+        let result = tokio::time::timeout(Duration::from_secs(1), state_rx.changed()).await;
+
+        assert!(result.is_ok(), "Coordinator failed to update state in time");
+
+        assert_eq!(*state_rx.borrow(), dummy_ip2);
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_unpauses_on_non_quorum_switch_master_ip() {
+        let dummy_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
+        let dummy_ip2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 6379);
+        let dummy_ip3 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 6379);
+
+        let (event_tx, event_rx) = mpsc::channel::<SwitchMasterEvent>(100);
+        let (state_tx, state_rx) = watch::channel(dummy_ip);
+
+        tokio::spawn(run_quorum_coordinator(2, event_rx, state_tx));
+
+        event_tx
+            .send(SwitchMasterEvent {
+                sentinel_id: (0),
+                new_addr: (dummy_ip2),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*state_rx.borrow(), dummy_ip);
+
+        event_tx
+            .send(SwitchMasterEvent {
+                sentinel_id: (1),
+                new_addr: (dummy_ip3),
+            })
+            .await
+            .unwrap();
+
         assert!(
             !state_rx.has_changed().unwrap(),
             "Coordinator should not have updated the state"
         );
 
-        assert_eq!(*state_rx.borrow(), ProxyState::Paused);
+        assert_eq!(*state_rx.borrow(), dummy_ip);
     }
 }
