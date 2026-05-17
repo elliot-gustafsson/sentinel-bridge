@@ -16,4 +16,5 @@ tracing-subscriber = { version = "0.3", features = [
     "json",
 ] }
 metrics = "0.22"
-metrics-exporter-prometheus = "0.13"
+metrics-exporter-prometheus = "0.14"
+metrics-util = "0.16"

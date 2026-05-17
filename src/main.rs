@@ -2,6 +2,7 @@ use axum::{Router, extract::State, http::StatusCode, routing::get};
 use fred::prelude::*;
 use fred::types::RedisConfig;
 use metrics::{counter, gauge};
+use metrics_exporter_prometheus::BuildError;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -62,10 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let quorum_size = (sentinels.len() / 2) + 1;
 
-    let prom_recorder = PrometheusBuilder::new().build_recorder();
-
-    let metrics_handle = prom_recorder.handle();
-    metrics::set_global_recorder(prom_recorder).expect("failed to setup metrics recorder");
+    let metrics_handle = setup_metrics().expect("failed to setup metrics recorder");
 
     info!(
         bind_addr = bind_addr,
@@ -136,6 +134,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("shutting down, bye bye!");
     Ok(())
+}
+
+fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
+    let metrics_handle = PrometheusBuilder::new()
+        .idle_timeout(
+            metrics_util::MetricKindMask::ALL,
+            Some(std::time::Duration::from_secs(600)),
+        )
+        .install_recorder()?;
+
+    let upkeep_handle = metrics_handle.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            upkeep_handle.run_upkeep();
+        }
+    });
+
+    Ok(metrics_handle)
 }
 
 async fn run_http_server(
