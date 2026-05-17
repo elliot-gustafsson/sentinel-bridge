@@ -270,11 +270,18 @@ async fn handle_client_connection(
                 }
             }
         }
-        Err(e) => error!(
-            master_addr = master_addr.to_string(),
-            error = e.to_string(),
-            "failed to connect to backend",
-        ),
+        Err(e) => {
+            counter!("proxy_backend_connection_errors_total",
+                "backend" => backend_label.clone()
+            )
+            .increment(1);
+
+            error!(
+                master_addr = master_addr.to_string(),
+                error = e.to_string(),
+                "failed to connect to backend",
+            )
+        }
     }
 
     gauge!("proxy_active_connections", "backend" => backend_label.clone()).decrement(1.0);
@@ -412,7 +419,7 @@ async fn run_sentinel_subscriber(
             continue;
         }
 
-        if let Err(e) = client.subscribe(vec!["+new-epoch", "+switch-master"]).await {
+        if let Err(e) = client.subscribe(vec!["+switch-master"]).await {
             error!(
                 sentinel = id,
                 error = e.to_string(),
