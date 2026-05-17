@@ -1,6 +1,8 @@
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use fred::prelude::*;
 use fred::types::RedisConfig;
+use metrics::{counter, gauge};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
@@ -22,6 +24,12 @@ struct SwitchMasterEvent {
     new_addr: SocketAddr,
 }
 
+#[derive(Clone)]
+struct AppState {
+    ready: Arc<AtomicBool>,
+    prom_handler: PrometheusHandle,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter = EnvFilter::try_from_default_env()
@@ -29,10 +37,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt()
         .with_target(true)
-        // .with_file(true)
-        // .with_line_number(true)
-        // .with_thread_ids(true)
-        // .pretty()
         .json()
         .flatten_event(true)
         .with_env_filter(env_filter)
@@ -58,6 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let quorum_size = (sentinels.len() / 2) + 1;
 
+    let prom_recorder = PrometheusBuilder::new().build_recorder();
+
+    let metrics_handle = prom_recorder.handle();
+    metrics::set_global_recorder(prom_recorder).expect("failed to setup metrics recorder");
+
     info!(
         bind_addr = bind_addr,
         master_name = master_name,
@@ -68,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ready = Arc::new(AtomicBool::new(false));
 
-    tokio::spawn(run_http_server(http_addr, ready.clone()));
+    tokio::spawn(run_http_server(http_addr, ready.clone(), metrics_handle));
 
     let verified_master = bootstrap_quorum_master(&sentinels, &master_name, quorum_size).await;
 
@@ -129,11 +138,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_http_server(bind_addr: String, ready: Arc<AtomicBool>) {
+async fn run_http_server(
+    bind_addr: String,
+    ready: Arc<AtomicBool>,
+    prom_handler: PrometheusHandle,
+) {
+    let state = AppState {
+        ready,
+        prom_handler,
+    };
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
-        .with_state(ready);
+        .route("/metrics", get(metrics_handler))
+        .with_state(state);
 
     let addr_clone = bind_addr.clone();
     let listener = TcpListener::bind(addr_clone)
@@ -151,12 +170,16 @@ async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
-async fn ready_handler(State(ready): State<Arc<AtomicBool>>) -> StatusCode {
-    if ready.load(Ordering::Relaxed) {
+async fn ready_handler(State(state): State<AppState>) -> StatusCode {
+    if state.ready.load(Ordering::Relaxed) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> String {
+    state.prom_handler.render()
 }
 
 async fn wait_for_shutdown(token: CancellationToken) {
@@ -196,6 +219,10 @@ async fn handle_client_connection(
 ) {
     let master_addr = *state_rx.borrow();
 
+    let backend_label = master_addr.to_string();
+    counter!("proxy_connections_total", "backend" => backend_label.clone()).increment(1);
+    gauge!("proxy_active_connections", "backend" => backend_label.clone()).increment(1.0);
+
     match TcpStream::connect(master_addr).await {
         Ok(mut backend_stream) => {
             let _ = client_stream.set_nodelay(true);
@@ -221,13 +248,24 @@ async fn handle_client_connection(
             };
 
             tokio::select! {
-                res = copy_bidirectional(&mut client_stream, &mut backend_stream) => {
-                    if let Err(e) = res {
-                        if e.kind() != std::io::ErrorKind::ConnectionReset {}
-                    }
+                _ = copy_bidirectional(&mut client_stream, &mut backend_stream) => {
+                    counter!("proxy_connections_closed_total",
+                        "reason" => "client_disconnect",
+                        "backend" => backend_label.clone()
+                    ).increment(1);
                 }
-                _ = invalidation_trigger => {}
-                _ = c_token.cancelled() => {}
+                _ = invalidation_trigger => {
+                    counter!("proxy_connections_closed_total",
+                        "reason" => "failover_severed",
+                        "backend" => backend_label.clone()
+                    ).increment(1);
+                }
+                _ = c_token.cancelled() => {
+                    counter!("proxy_connections_closed_total",
+                        "reason" => "graceful_shutdown",
+                        "backend" => backend_label.clone()
+                    ).increment(1);
+                }
             }
         }
         Err(e) => error!(
@@ -236,6 +274,8 @@ async fn handle_client_connection(
             "failed to connect to backend",
         ),
     }
+
+    gauge!("proxy_active_connections", "backend" => backend_label.clone()).decrement(1.0);
 }
 
 /// Concurrently queries all Sentinels and waits until a strict majority agree on the master.
@@ -257,12 +297,6 @@ async fn bootstrap_quorum_master(
         let mut master_votes: HashMap<SocketAddr, usize> = HashMap::new();
 
         while let Some(res) = tasks.join_next().await {
-            // match &res {
-            //     Ok(Ok(addr)) => info!("Bootstrap response: Success -> {}", addr),
-            //     Ok(Err(e)) => info!("Bootstrap response: Sentinel Error -> {}", e),
-            //     Err(e) => info!("Bootstrap response: Task Panic/Cancel -> {}", e),
-            // }
-
             if let Ok(Ok(addr)) = res {
                 let count = master_votes.entry(addr).or_insert(0);
                 *count += 1;
@@ -320,9 +354,12 @@ async fn run_quorum_coordinator(
         let votes = master_votes.entry(event.new_addr).or_default();
         votes.insert(event.sentinel_id);
 
-        if votes.len() >= quorum && *state_tx.borrow() != event.new_addr {
+        let current_master = *state_tx.borrow();
+
+        if votes.len() >= quorum && current_master != event.new_addr {
             info!(
                 current_master = event.new_addr.to_string(),
+                old_master = current_master.to_string(),
                 "new master elected"
             );
             let _ = state_tx.send(event.new_addr);
