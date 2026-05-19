@@ -77,7 +77,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(run_http_server(http_addr, ready.clone(), metrics_handle));
 
-    let verified_master = bootstrap_quorum_master(&sentinels, &master_name, quorum_size).await;
+    let shutdown_token = CancellationToken::new();
+
+    tokio::spawn(wait_for_shutdown(shutdown_token.clone(), ready.clone()));
+
+    let verified_master = match bootstrap_quorum_master(
+        shutdown_token.clone(),
+        &sentinels,
+        &master_name,
+        quorum_size,
+    )
+    .await
+    {
+        Some(addr) => addr,
+        None => {
+            info!("bootstrap cancelled, shutting down");
+            return Ok(());
+        }
+    };
 
     info!(
         current_master = verified_master.to_string(),
@@ -99,10 +116,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("proxy listening on {}", bind_addr);
-
-    let shutdown_token = CancellationToken::new();
-
-    tokio::spawn(wait_for_shutdown(shutdown_token.clone(), ready));
 
     let mut connection_tasks = JoinSet::new();
 
@@ -306,35 +319,55 @@ async fn handle_client_connection(
 
 /// Concurrently queries all Sentinels and waits until a strict majority agree on the master.
 async fn bootstrap_quorum_master(
+    token: CancellationToken,
     sentinels: &[String],
     master_name: &str,
     quorum_size: usize,
-) -> SocketAddr {
-    loop {
-        let mut tasks = JoinSet::new();
-
-        for url in sentinels {
-            let url_cloned = url.clone();
-            let name_cloned = master_name.to_string();
-
-            tasks.spawn(async move { bootstrap_single_master(&url_cloned, &name_cloned).await });
+) -> Option<SocketAddr> {
+    tokio::select! {
+        _ = token.cancelled() => {
+            None
         }
+        addr = async {
+            loop {
+                let mut tasks = JoinSet::new();
 
-        let mut master_votes: HashMap<SocketAddr, usize> = HashMap::new();
+                for url in sentinels {
+                    let url_cloned = url.clone();
+                    let name_cloned = master_name.to_string();
 
-        while let Some(res) = tasks.join_next().await {
-            if let Ok(Ok(addr)) = res {
-                let count = master_votes.entry(addr).or_insert(0);
-                *count += 1;
-
-                if *count >= quorum_size {
-                    return addr;
+                    tasks
+                        .spawn(async move { bootstrap_single_master(&url_cloned, &name_cloned).await });
                 }
-            }
-        }
 
-        error!("failed to reach quorum, retrying in 2 seconds...");
-        sleep(Duration::from_secs(2)).await;
+                let mut master_votes: HashMap<SocketAddr, usize> = HashMap::new();
+
+                while let Some(res) = tasks.join_next().await {
+                    match res {
+                        Ok(Ok(addr)) => {
+                            let count = master_votes.entry(addr).or_insert(0);
+                            *count += 1;
+
+                            if *count >= quorum_size {
+                                return addr;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            error!(error = e.to_string(), sentinel = 1, "error getting master address")
+                        }
+
+                        Err(e) => {
+                            error!(error = e.to_string(),"bootstrap task failed")
+                        }
+                    }
+                }
+
+                error!("failed to reach quorum, retrying in 2 seconds...");
+                sleep(Duration::from_secs(2)).await;
+            }
+        } => {
+            Some(addr)
+        }
     }
 }
 
