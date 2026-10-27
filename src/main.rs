@@ -1,23 +1,55 @@
-use axum::{Router, extract::State, http::StatusCode, routing::get};
-use fred::prelude::*;
-use fred::types::RedisConfig;
-use metrics::{counter, gauge};
-use metrics_exporter_prometheus::BuildError;
+use arc_swap::{ArcSwap, ArcSwapAny};
+use axum::{Router, http::StatusCode, routing::get};
+use clap::Parser;
+use metrics::{Counter, Gauge, counter, describe_counter, describe_gauge, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use std::collections::{HashMap, HashSet};
-use std::env;
-use std::net::SocketAddr;
+use redis::RedisError;
+use redis::aio::{ConnectionManager, PubSub};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::copy_bidirectional;
+use std::time::Duration;
+use tokio::io::copy;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{OnceCell, mpsc, mpsc::Receiver, mpsc::Sender};
 use tokio::task::JoinSet;
-use tokio::time::{Duration, sleep};
+use tokio::time::sleep;
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing::{debug, error, info, warn};
+
+#[derive(Parser, Debug)]
+#[command(name = "sentinel-bridge", version, about)]
+struct Config {
+    #[arg(long, env = "LOG_LEVEL", default_value = "INFO")]
+    log_level: tracing::Level,
+
+    #[arg(long, env = "HTTP_BIND_ADDR", default_value = "0.0.0.0:8080")]
+    http_bind_addr: String,
+
+    #[arg(long, env = "PROXY_BIND_ADDR", default_value = "0.0.0.0:6379")]
+    proxy_bind_addr: String,
+
+    #[arg(long, env = "MASTER_NAME")]
+    master_name: String,
+
+    #[arg(long, env = "SENTINEL_ADDRS")]
+    sentinel_addrs: String,
+
+    #[arg(long, env = "BACKEND_DIAL_TIMEOUT", default_value = "3s", value_parser = humantime::parse_duration)]
+    backend_dial_timeout: Duration,
+
+    #[arg(long, env = "TERMINATION_GRACE_PERIOD", default_value = "5s", value_parser = humantime::parse_duration)]
+    termination_grace_period: Duration,
+
+    #[arg(long, env = "CONNECTION_DRAIN_TIMEOUT", default_value = "30s", value_parser = humantime::parse_duration)]
+    connection_drain_timeout: Duration,
+
+    #[arg(long, env = "RECONCILE_INTERVAL", default_value = "10s", value_parser = humantime::parse_duration)]
+    reconcile_interval: Duration,
+}
 
 #[derive(Debug)]
 struct SwitchMasterEvent {
@@ -26,48 +58,178 @@ struct SwitchMasterEvent {
 }
 
 #[derive(Clone)]
-struct AppState {
-    ready: Arc<AtomicBool>,
-    prom_handler: PrometheusHandle,
+struct ProxyMetrics {
+    connections_total: Counter,
+    active_connections: Gauge,
+    backend_connection_errors: Counter,
+    closed_graceful: Counter,
+    closed_severed: Counter,
+    closed_client_disconnect: Counter,
+    closed_server_disconnect: Counter,
+}
+
+struct ProxyState {
+    addr: SocketAddr,
+    ctx: CancellationToken,
+    metrics: ProxyMetrics,
+}
+
+impl ProxyState {
+    fn new(addr: SocketAddr) -> Self {
+        let addr_str = addr.to_string();
+        Self {
+            addr,
+            ctx: CancellationToken::new(),
+            metrics: ProxyMetrics {
+                connections_total: counter!("proxy_connections_total", "backend" => addr_str.clone()),
+                active_connections: gauge!("proxy_active_connections", "backend" => addr_str.clone()),
+                backend_connection_errors: counter!("proxy_backend_connection_errors_total", "backend" => addr_str.clone()),
+                closed_graceful: counter!("proxy_connections_closed_total", "backend" => addr_str.clone(), "reason" => "graceful_shutdown"),
+                closed_severed: counter!("proxy_connections_closed_total", "backend" => addr_str.clone(), "reason" => "failover_severed"),
+                closed_client_disconnect: counter!("proxy_connections_closed_total", "backend" => addr_str.clone(), "reason" => "client_disconnect"),
+                closed_server_disconnect: counter!("proxy_connections_closed_total", "backend" => addr_str, "reason" => "server_disconnect"),
+            },
+        }
+    }
+}
+
+struct Sentinel {
+    client: redis::Client,
+    conn: OnceCell<ConnectionManager>,
+}
+
+impl Sentinel {
+    fn new(addr: &str) -> Result<Self, RedisError> {
+        return Ok(Self {
+            client: redis::Client::open(addr)?,
+            conn: OnceCell::new(),
+        });
+    }
+
+    async fn conn(&self) -> Result<ConnectionManager, RedisError> {
+        return self
+            .conn
+            .get_or_try_init(|| self.client.get_connection_manager())
+            .await
+            .cloned();
+    }
+
+    async fn pubsub(&self) -> Result<PubSub, RedisError> {
+        return self.client.get_async_pubsub().await;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Dialer {
+    timeout: Duration,
+}
+
+impl Dialer {
+    async fn dial(&self, ctx: &CancellationToken, addr: SocketAddr) -> std::io::Result<TcpStream> {
+        tokio::time::timeout(
+            self.timeout,
+            ctx.run_until_cancelled(TcpStream::connect(addr)),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timed out"))?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Interrupted, "context cancelled"))?
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("error,sentinel_bridge=info"));
+    let config = Config::parse();
 
     tracing_subscriber::fmt()
-        .with_target(true)
         .json()
         .flatten_event(true)
-        .with_env_filter(env_filter)
+        .with_max_level(config.log_level)
         .init();
 
-    let http_addr = env::var("HTTP_BIND_ADDR").unwrap_or("0.0.0.0:8080".to_string());
-    let bind_addr = env::var("PROXY_BIND_ADDR").unwrap_or("0.0.0.0:6379".to_string());
+    let token = CancellationToken::new();
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigquit = signal(SignalKind::quit())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
 
-    let master_name = env::var("MASTER_NAME")
-        .map_err(|_| "FATAL: MASTER_NAME environment variable is missing")?;
-    let sentinel_env = env::var("SENTINEL_ADDRS")
-        .map_err(|_| "FATAL: SENTINEL_ADDRS environment variable is missing")?;
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigquit.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+        token_clone.cancel();
+    });
+    let _guard = token.clone().drop_guard();
 
-    let sentinels: Vec<String> = sentinel_env
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    if let Err(e) = run(token, config).await {
+        error!("{e}");
+        std::process::exit(1);
+    }
+    return Ok(());
+}
+
+async fn run(ctx: CancellationToken, config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.reconcile_interval.is_zero() {
+        return Err("RECONCILE_INTERVAL must be greater than 0".into());
+    }
+
+    let mut sentinels: Vec<Arc<Sentinel>> = Vec::new();
+    let mut connected_sentinels = 0;
+    for s in config.sentinel_addrs.split(',') {
+        let addr = s.trim();
+        if addr.is_empty() {
+            continue;
+        }
+
+        let sentinel = Arc::new(
+            Sentinel::new(addr).map_err(|e| format!("error parsing sentinel url, err: {e}"))?,
+        );
+
+        match sentinel.conn().await {
+            Err(e) => warn!(error = %e, "failed initial connect to sentinel"),
+            Ok(_) => connected_sentinels += 1,
+        }
+        sentinels.push(sentinel);
+    }
 
     if sentinels.is_empty() {
-        return Err("FATAL: SENTINEL_ADDRS contains no valid endpoints".into());
+        return Err("SENTINEL_ADDRS contains no valid endpoints".into());
     }
 
     let quorum_size = (sentinels.len() / 2) + 1;
 
-    let metrics_handle = setup_metrics().expect("failed to setup metrics recorder");
+    if connected_sentinels < quorum_size {
+        return Err(format!(
+            "not enough sentinels available to reach quorum, available: {connected_sentinels}, required_quorum: {quorum_size}, expected_total: {}",
+            sentinels.len()
+        )
+        .into());
+    }
+
+    let http_listener = TcpListener::bind(&config.http_bind_addr)
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to bind listener, addr: {}, err: {e}",
+                config.http_bind_addr
+            )
+        })?;
+
+    info!("http server listening on {}", config.http_bind_addr);
+
+    let proxy_listener = TcpListener::bind(&config.proxy_bind_addr)
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to bind listener, addr: {}, err: {e}",
+                config.proxy_bind_addr
+            )
+        })?;
 
     info!(
-        bind_addr = bind_addr,
-        master_name = master_name,
+        bind_addr = config.proxy_bind_addr,
+        master_name = config.master_name,
         quorum_size = quorum_size,
         sentinels_count = sentinels.len(),
         "starting proxy",
@@ -75,518 +237,538 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ready = Arc::new(AtomicBool::new(false));
 
-    tokio::spawn(run_http_server(http_addr, ready.clone(), metrics_handle));
+    let run_ctx = CancellationToken::new();
+    let _guard = run_ctx.clone().drop_guard();
 
-    let shutdown_token = CancellationToken::new();
+    let prom_handle = PrometheusBuilder::new().install_recorder()?;
 
-    tokio::spawn(wait_for_shutdown(shutdown_token.clone(), ready.clone()));
+    describe_counter!(
+        "proxy_connections_total",
+        "Total number of connections opened to the backend"
+    );
+    describe_counter!(
+        "proxy_connections_closed_total",
+        "Total number of connections closed"
+    );
+    describe_counter!(
+        "proxy_backend_connection_errors_total",
+        "Total number of failed connection attempts to backend"
+    );
+    describe_gauge!(
+        "proxy_active_connections",
+        "Current number of active connections to the backend"
+    );
 
-    let verified_master = match bootstrap_quorum_master(
-        shutdown_token.clone(),
-        &sentinels,
-        &master_name,
-        quorum_size,
-    )
-    .await
-    {
-        Some(addr) => addr,
-        None => {
-            info!("bootstrap cancelled, shutting down");
-            return Ok(());
+    tokio::spawn(run_http_server(
+        run_ctx.clone(),
+        http_listener,
+        ready.to_owned(),
+        prom_handle,
+    ));
+
+    let bootstrap_start = tokio::time::Instant::now();
+    let verified_master = loop {
+        match resolve_master_by_quorum(
+            ctx.clone(),
+            &sentinels,
+            config.master_name.clone(),
+            quorum_size,
+        )
+        .await
+        {
+            Ok(addr) => break addr,
+            Err(err) => {
+                if ctx.is_cancelled() {
+                    return Err("context cancelled".into());
+                }
+                if bootstrap_start.elapsed() > Duration::from_secs(30) {
+                    return Err(format!(
+                        "bootstrap timed out waiting for sentinel quorum (30s): {err}"
+                    )
+                    .into());
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
         }
     };
 
-    info!(
-        current_master = verified_master.to_string(),
-        "bootstrap finished"
-    );
+    info!(verified_master = %verified_master, "bootstrap finished");
 
     ready.store(true, Ordering::Relaxed);
 
-    let (event_tx, event_rx) = mpsc::channel::<SwitchMasterEvent>(100);
-    let (state_tx, state_rx) = watch::channel(verified_master);
+    let (event_tx, event_rx) = mpsc::channel::<SwitchMasterEvent>(sentinels.len() * 2);
+    let state_pointer = Arc::new(ArcSwap::from_pointee(ProxyState::new(verified_master)));
 
-    for (id, url) in sentinels.iter().enumerate() {
-        let tx = event_tx.clone();
-        let name = master_name.clone();
-        tokio::spawn(run_sentinel_subscriber(id, url.to_owned(), name, tx));
+    for (i, s) in sentinels.iter().enumerate() {
+        tokio::spawn(run_sentinel_subscriber(
+            run_ctx.clone(),
+            i,
+            s.clone(),
+            config.master_name.clone(),
+            event_tx.clone(),
+        ));
     }
 
-    tokio::spawn(run_quorum_coordinator(quorum_size, event_rx, state_tx));
+    tokio::spawn(run_quorum_coordinator(
+        run_ctx.clone(),
+        quorum_size,
+        event_rx,
+        state_pointer.clone(),
+    ));
 
-    let listener = TcpListener::bind(&bind_addr).await?;
-    info!("proxy listening on {}", bind_addr);
+    tokio::spawn(run_reconciliation_loop(
+        run_ctx.clone(),
+        sentinels,
+        config.master_name.clone(),
+        quorum_size,
+        event_tx,
+        state_pointer.clone(),
+        config.reconcile_interval,
+    ));
 
-    let mut connection_tasks = JoinSet::new();
-
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (client_stream, _) = match accept_result {
-                    Ok(val) => val,
-                    Err(e) => {
-                        error!(error = e.to_string(), "failed to accept connection");
-                        continue;
-                    }
-                };
-
-                let current_state_rx = state_rx.clone();
-                let c_token = shutdown_token.clone();
-
-                connection_tasks.spawn(handle_client_connection(c_token, client_stream, current_state_rx));
-            }
-
-            _ = shutdown_token.cancelled() => {
-                break;
-            }
-        }
-    }
-
-    info!("waiting for active connections to drain...");
-    while let Some(_) = connection_tasks.join_next().await {}
-
-    info!("shutting down, bye bye!");
-    Ok(())
-}
-
-fn setup_metrics() -> Result<PrometheusHandle, BuildError> {
-    let metrics_handle = PrometheusBuilder::new()
-        .idle_timeout(
-            metrics_util::MetricKindMask::ALL,
-            Some(std::time::Duration::from_secs(600)),
-        )
-        .install_recorder()?;
-
-    let upkeep_handle = metrics_handle.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            upkeep_handle.run_upkeep();
-        }
-    });
-
-    Ok(metrics_handle)
-}
-
-async fn run_http_server(
-    bind_addr: String,
-    ready: Arc<AtomicBool>,
-    prom_handler: PrometheusHandle,
-) {
-    let state = AppState {
-        ready,
-        prom_handler,
+    let backend_dialer = Dialer {
+        timeout: config.backend_dial_timeout,
     };
 
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/ready", get(ready_handler))
-        .route("/metrics", get(metrics_handler))
-        .with_state(state);
+    let accept_ctx = CancellationToken::new();
+    let accept_ctx_clone = accept_ctx.clone();
+    let ctx_clone = ctx.clone();
+    let run_ctx_clone = run_ctx.clone();
 
-    let addr_clone = bind_addr.clone();
-    let listener = TcpListener::bind(addr_clone)
-        .await
-        .expect("failed to bind http server");
+    let accept_task = tokio::spawn(async move {
+        let mut active_connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accept_result = proxy_listener.accept() => {
+                    let (client_stream, _) = match accept_result {
+                        Ok(val) => val,
+                        Err(e) => {
+                            error!(error = %e, "failed to accept connection");
+                            sleep(Duration::from_millis(10)).await;
+                            continue;
+                        }
+                    };
 
-    info!("http server listening on {}", bind_addr);
+                    active_connections.spawn(handle_client_connection(
+                        ctx_clone.clone(),
+                        run_ctx_clone.clone(),
+                        backend_dialer,
+                        client_stream,
+                        state_pointer.clone(),
+                    ));
+                }
+                Some(_) = active_connections.join_next(), if !active_connections.is_empty() => {}
+                _ = accept_ctx_clone.cancelled() => break,
+            }
+        }
+        active_connections
+    });
 
-    if let Err(e) = axum::serve(listener, app).await {
-        error!(error = e.to_string(), "http server error");
-    }
-}
-
-async fn health_handler() -> StatusCode {
-    StatusCode::OK
-}
-
-async fn ready_handler(State(state): State<AppState>) -> StatusCode {
-    if state.ready.load(Ordering::Relaxed) {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
-}
-
-async fn metrics_handler(State(state): State<AppState>) -> String {
-    state.prom_handler.render()
-}
-
-async fn wait_for_shutdown(token: CancellationToken, ready: Arc<AtomicBool>) {
-    let mut sigint =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-
-    let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit()).unwrap();
-
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-
-    tokio::select! {
-        _ = async {
-            sigint.recv().await;
-        } => {},
-        _ = async {
-            sigquit.recv().await;
-        } => {},
-        _ = async {
-            sigterm.recv().await;
-        } => {},
-    }
+    ctx.cancelled().await;
 
     info!("received termination signal");
     ready.store(false, Ordering::Relaxed);
 
-    info!("sleeping for 5s...");
-
-    sleep(Duration::from_secs(5)).await;
+    info!(
+        period_ms = config.termination_grace_period.as_millis() as u64,
+        "entering graceful shutdown delay"
+    );
+    sleep(config.termination_grace_period).await;
 
     info!("starting shutdown...");
-    token.cancel();
+    accept_ctx.cancel();
+    let mut active_connections = accept_task.await?;
+
+    info!("waiting for active connections to drain...");
+    if tokio::time::timeout(config.connection_drain_timeout, async {
+        while active_connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        warn!(
+            timeout_ms = config.connection_drain_timeout.as_millis() as u64,
+            "connection drain timeout reached, closing active connections..."
+        );
+        run_ctx.cancel();
+        while active_connections.join_next().await.is_some() {}
+    }
+
+    info!("shutting down, bye bye!");
+    return Ok(());
+}
+
+async fn run_http_server(
+    ctx: CancellationToken,
+    listener: TcpListener,
+    ready: Arc<AtomicBool>,
+    prom_handle: PrometheusHandle,
+) {
+    let app = Router::new()
+        .route("/health", get(|| async { StatusCode::OK }))
+        .route(
+            "/ready",
+            get(move || async move {
+                if ready.load(Ordering::Relaxed) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
+        .route("/metrics", get(move || async move { prom_handle.render() }));
+
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(ctx.cancelled_owned())
+        .await
+    {
+        error!(error = %e, "http server error");
+    }
 }
 
 async fn handle_client_connection(
-    c_token: CancellationToken,
+    ctx: CancellationToken,
+    run_ctx: CancellationToken,
+    dialer: Dialer,
     mut client_stream: TcpStream,
-    mut state_rx: watch::Receiver<SocketAddr>,
+    state_pointer: Arc<ArcSwapAny<Arc<ProxyState>>>,
 ) {
-    let master_addr = *state_rx.borrow();
+    let current_state = state_pointer.load();
+    let master_addr = current_state.addr;
+    let metrics = &current_state.metrics;
 
-    let backend_label = master_addr.to_string();
-    counter!("proxy_connections_total", "backend" => backend_label.clone()).increment(1);
-    gauge!("proxy_active_connections", "backend" => backend_label.clone()).increment(1.0);
-
-    match TcpStream::connect(master_addr).await {
-        Ok(mut backend_stream) => {
-            let _ = client_stream.set_nodelay(true);
-            let _ = backend_stream.set_nodelay(true);
-
-            let invalidation_trigger = async {
-                let current_addr = *state_rx.borrow_and_update();
-                if current_addr != master_addr {
-                    return;
-                }
-
-                loop {
-                    if state_rx.changed().await.is_err() {
-                        break;
-                    }
-
-                    let new_addr = *state_rx.borrow_and_update();
-
-                    if new_addr != master_addr {
-                        break;
-                    }
-                }
-            };
-
-            tokio::select! {
-                _ = copy_bidirectional(&mut client_stream, &mut backend_stream) => {
-                    counter!("proxy_connections_closed_total",
-                        "reason" => "client_disconnect",
-                        "backend" => backend_label.clone()
-                    ).increment(1);
-                }
-                _ = invalidation_trigger => {
-                    counter!("proxy_connections_closed_total",
-                        "reason" => "failover_severed",
-                        "backend" => backend_label.clone()
-                    ).increment(1);
-                }
-                _ = c_token.cancelled() => {
-                    counter!("proxy_connections_closed_total",
-                        "reason" => "graceful_shutdown",
-                        "backend" => backend_label.clone()
-                    ).increment(1);
-                }
-            }
-        }
+    let mut backend_stream = match dialer.dial(&current_state.ctx, master_addr).await {
+        Ok(val) => val,
         Err(e) => {
-            counter!("proxy_backend_connection_errors_total",
-                "backend" => backend_label.clone()
-            )
-            .increment(1);
-
-            error!(
-                master_addr = master_addr.to_string(),
-                error = e.to_string(),
-                "failed to connect to backend",
-            )
+            metrics.backend_connection_errors.increment(1);
+            error!(%master_addr, error = %e, "failed to connect to backend");
+            return;
         }
-    }
+    };
 
-    gauge!("proxy_active_connections", "backend" => backend_label.clone()).decrement(1.0);
-}
+    let _ = client_stream.set_nodelay(true);
+    let _ = backend_stream.set_nodelay(true);
 
-/// Concurrently queries all Sentinels and waits until a strict majority agree on the master.
-async fn bootstrap_quorum_master(
-    token: CancellationToken,
-    sentinels: &[String],
-    master_name: &str,
-    quorum_size: usize,
-) -> Option<SocketAddr> {
+    metrics.connections_total.increment(1);
+    metrics.active_connections.increment(1.0);
+
+    let (mut client_read, mut client_write) = client_stream.split();
+    let (mut backend_read, mut backend_write) = backend_stream.split();
+
     tokio::select! {
-        _ = token.cancelled() => {
-            None
-        }
-        addr = async {
-            loop {
-                let mut tasks = JoinSet::new();
-
-                for url in sentinels {
-                    let url_cloned = url.clone();
-                    let name_cloned = master_name.to_string();
-
-                    tasks
-                        .spawn(async move { bootstrap_single_master(&url_cloned, &name_cloned).await });
-                }
-
-                let mut master_votes: HashMap<SocketAddr, usize> = HashMap::new();
-
-                while let Some(res) = tasks.join_next().await {
-                    match res {
-                        Ok(Ok(addr)) => {
-                            let count = master_votes.entry(addr).or_insert(0);
-                            *count += 1;
-
-                            if *count >= quorum_size {
-                                return addr;
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            error!(error = e.to_string(), sentinel = 1, "error getting master address")
-                        }
-
-                        Err(e) => {
-                            error!(error = e.to_string(),"bootstrap task failed")
-                        }
-                    }
-                }
-
-                error!("failed to reach quorum, retrying in 2 seconds...");
-                sleep(Duration::from_secs(2)).await;
+        _ = copy(&mut client_read, &mut backend_write) => {
+            if ctx.is_cancelled() {
+                metrics.closed_graceful.increment(1);
+            } else {
+                metrics.closed_client_disconnect.increment(1);
             }
-        } => {
-            Some(addr)
+        }
+        _ = copy(&mut backend_read, &mut client_write) => {
+            if ctx.is_cancelled() {
+                metrics.closed_graceful.increment(1);
+            } else {
+                metrics.closed_server_disconnect.increment(1);
+            }
+        }
+        _ = current_state.ctx.cancelled() => {
+            metrics.closed_severed.increment(1);
+        }
+        _ = run_ctx.cancelled() => {
+            metrics.closed_severed.increment(1);
         }
     }
+
+    metrics.active_connections.decrement(1.0);
 }
 
-/// Helper function to query a single Sentinel
-async fn bootstrap_single_master(
-    sentinel_url: &str,
-    master_name: &str,
-) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let config = RedisConfig::from_url(sentinel_url)?;
-    let client = Builder::from_config(config).build()?;
-    client.init().await?;
-
-    let addr_parts: Vec<String> = client
-        .custom(
-            fred::types::CustomCommand::new_static(
-                "SENTINEL",
-                fred::types::ClusterHash::Random,
-                false,
-            ),
-            vec!["get-master-addr-by-name", master_name],
-        )
-        .await?;
-
-    let _ = client.quit().await;
-
-    if addr_parts.len() == 2 {
-        let addr: SocketAddr = format!("{}:{}", addr_parts[0], addr_parts[1]).parse()?;
-        Ok(addr)
-    } else {
-        Err("Invalid response format".into())
-    }
-}
-
-/// Aggregates events from the Sentinel streams and enforces quorum rules.
 async fn run_quorum_coordinator(
-    quorum: usize,
-    mut event_rx: mpsc::Receiver<SwitchMasterEvent>,
-    state_tx: watch::Sender<SocketAddr>,
+    ctx: CancellationToken,
+    quorum_size: usize,
+    mut switch_event_receiver: Receiver<SwitchMasterEvent>,
+    state_pointer: Arc<ArcSwapAny<Arc<ProxyState>>>,
 ) {
-    let mut master_votes: HashMap<SocketAddr, HashSet<usize>> = HashMap::new();
+    struct VoteEntry {
+        addr: SocketAddr,
+        t: tokio::time::Instant,
+    }
 
-    while let Some(event) = event_rx.recv().await {
-        let votes = master_votes.entry(event.new_addr).or_default();
-        votes.insert(event.sentinel_id);
+    let mut sentinel_votes: HashMap<usize, VoteEntry> = HashMap::new();
 
-        let current_master = *state_tx.borrow();
+    while let Some(Some(event)) = ctx.run_until_cancelled(switch_event_receiver.recv()).await {
+        let current_state = state_pointer.load();
 
-        if votes.len() >= quorum && current_master != event.new_addr {
-            info!(
-                current_master = event.new_addr.to_string(),
-                old_master = current_master.to_string(),
-                "new master elected"
-            );
-            let _ = state_tx.send(event.new_addr);
-            master_votes.clear();
+        if current_state.addr == event.new_addr {
+            sentinel_votes.remove(&event.sentinel_id);
+            continue;
         }
+
+        let now = tokio::time::Instant::now();
+        sentinel_votes.insert(
+            event.sentinel_id,
+            VoteEntry {
+                addr: event.new_addr,
+                t: now,
+            },
+        );
+
+        let mut vote_count = 0;
+        sentinel_votes.retain(|_, v| {
+            if now.duration_since(v.t) > Duration::from_secs(120) {
+                return false; // delete expired entry
+            }
+            if v.addr == event.new_addr {
+                vote_count += 1;
+            }
+            true // keep entry
+        });
+
+        if vote_count < quorum_size || current_state.addr == event.new_addr {
+            continue;
+        }
+
+        info!(current_master = %event.new_addr, old_master = %current_state.addr, "new master elected");
+
+        let new_state = ProxyState::new(event.new_addr);
+        state_pointer.store(Arc::new(new_state));
+
+        current_state.ctx.cancel();
+
+        sentinel_votes.clear();
     }
 }
 
 async fn run_sentinel_subscriber(
+    ctx: CancellationToken,
     id: usize,
-    url: String,
+    sentinel: Arc<Sentinel>,
     master_name: String,
-    tx: mpsc::Sender<SwitchMasterEvent>,
+    switch_event_sender: Sender<SwitchMasterEvent>,
 ) {
+    const DEFAULT_BACKOFF: Duration = Duration::from_millis(100);
+    const MAX_BACKOFF: Duration = Duration::from_secs(5);
+    let mut backoff = DEFAULT_BACKOFF;
+
     loop {
-        let config = match RedisConfig::from_url(&url) {
-            Ok(c) => c,
+        let mut pubsub = match sentinel.pubsub().await {
+            Ok(x) => x,
             Err(e) => {
-                error!(
-                    sentinel = id,
-                    error = e.to_string(),
-                    "error creating config",
-                );
-                sleep(Duration::from_secs(2)).await;
+                error!(sentinel = id, error = %e, "error creating pubsub connection");
+                tokio::select! {
+                    _ = sleep(backoff) => {}
+                    _ = ctx.cancelled() => return,
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
         };
 
-        let mut builder = Builder::from_config(config);
-        builder.set_policy(fred::types::ReconnectPolicy::new_constant(0, 0));
-
-        let client = match builder.build_subscriber_client() {
-            Ok(c) => c,
-            Err(e) => {
-                error!(
-                    sentinel = id,
-                    error = e.to_string(),
-                    "error creating client",
-                );
-                sleep(Duration::from_secs(2)).await;
-                continue;
+        if let Err(e) = pubsub.subscribe(&["+new-epoch", "+switch-master"]).await {
+            error!(sentinel = id, error = %e, "error subscribing to sentinel channels");
+            tokio::select! {
+                _ = sleep(backoff) => {}
+                _ = ctx.cancelled() => return,
             }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+            continue;
         };
 
-        if let Err(e) = client.init().await {
-            error!(sentinel = id, error = e.to_string(), "connection failed",);
-            sleep(Duration::from_secs(2)).await;
-            continue;
-        }
+        let start_time = tokio::time::Instant::now();
+        let mut stream = pubsub.into_on_message();
 
-        if let Err(e) = client.subscribe(vec!["+switch-master"]).await {
-            error!(
-                sentinel = id,
-                error = e.to_string(),
-                "error setting up subscriber",
-            );
-            let _ = client.quit().await;
-            sleep(Duration::from_secs(2)).await;
-            continue;
-        }
+        loop {
+            let msg = match ctx.run_until_cancelled(stream.next()).await {
+                Some(Some(m)) => m,
+                Some(None) => break, // stream disconnected
+                None => return,      // ctx cancelled
+            };
 
-        let mut message_stream = client.message_rx();
+            let Ok(payload) = msg.get_payload::<String>() else {
+                continue;
+            };
 
-        while let Ok(msg) = message_stream.recv().await {
-            let channel = msg.channel.to_string();
+            match msg.get_channel_name() {
+                "+new-epoch" => {
+                    info!(message = payload, "new epoch detected");
+                }
+                "+switch-master" => {
+                    // Format: <master-name> <old-ip> <old-port> <new-ip> <new-port>
+                    let mut parts = payload.split_whitespace();
+                    let (Some(name), Some(ip_str), Some(port_str)) =
+                        (parts.next(), parts.nth(2), parts.next())
+                    else {
+                        error!(
+                            sentinel = id,
+                            payload, "unexpected format of +switch-master event payload"
+                        );
+                        continue;
+                    };
 
-            if let Some(payload) = msg.value.as_string() {
-                if channel == "+switch-master" {
-                    let parts: Vec<&str> = payload.split_whitespace().collect();
+                    if name != master_name {
+                        continue;
+                    }
 
-                    if parts.len() >= 5 && parts[0] == master_name {
-                        let new_ip = parts[3];
-                        let new_port = parts[4];
-                        if let Ok(new_addr) =
-                            format!("{}:{}", new_ip, new_port).parse::<SocketAddr>()
-                        {
-                            let _ = tx
-                                .send(SwitchMasterEvent {
-                                    sentinel_id: id,
-                                    new_addr,
-                                })
-                                .await;
+                    let ip = match ip_str.parse::<IpAddr>() {
+                        Ok(x) => x,
+                        Err(e) => {
+                            error!(sentinel = id, error = %e, "failed to parse new master ip");
+                            continue;
                         }
+                    };
+                    let port = match port_str.parse::<u16>() {
+                        Ok(x) => x,
+                        Err(e) => {
+                            error!(sentinel = id, error = %e, "failed to parse new master port");
+                            continue;
+                        }
+                    };
+
+                    let new_addr = SocketAddr::new(ip, port);
+                    match ctx
+                        .run_until_cancelled(switch_event_sender.send(SwitchMasterEvent {
+                            sentinel_id: id,
+                            new_addr,
+                        }))
+                        .await
+                    {
+                        Some(Ok(())) => {}
+                        Some(Err(_)) | None => return, // channel closed or ctx cancelled
                     }
                 }
+                _ => {}
             }
         }
 
-        error!(sentinel = id, "disconnected, reconnecting...",);
-        let _ = client.quit().await;
-        sleep(Duration::from_secs(2)).await;
+        if start_time.elapsed() > MAX_BACKOFF {
+            backoff = DEFAULT_BACKOFF;
+        }
+
+        error!(
+            sentinel = id,
+            reconnecting_in_ms = backoff.as_millis() as u64,
+            "sentinel subscriber disconnected"
+        );
+
+        tokio::select! {
+            _ = sleep(backoff) => {}
+            _ = ctx.cancelled() => return,
+        }
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+async fn run_reconciliation_loop(
+    ctx: CancellationToken,
+    sentinels: Vec<Arc<Sentinel>>,
+    master_name: String,
+    quorum_size: usize,
+    switch_event_sender: Sender<SwitchMasterEvent>,
+    state_pointer: Arc<ArcSwapAny<Arc<ProxyState>>>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await; // consume the immediate t=0 tick
 
-    #[tokio::test]
-    async fn test_coordinator_unpauses_on_quorum_switch_master() {
-        let dummy_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
-        let dummy_ip2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 6379);
+    while ctx.run_until_cancelled(ticker.tick()).await.is_some() {
+        let current_quorum_master = match resolve_master_by_quorum(
+            ctx.clone(),
+            &sentinels,
+            master_name.clone(),
+            quorum_size,
+        )
+        .await
+        {
+            Ok(master) => master,
+            Err(e) => {
+                info!(error = %e, "background master reconciliation failed to reach quorum");
+                continue;
+            }
+        };
 
-        let (event_tx, event_rx) = mpsc::channel::<SwitchMasterEvent>(100);
-        let (state_tx, mut state_rx) = watch::channel(dummy_ip);
+        let current_state = state_pointer.load();
+        if current_state.addr == current_quorum_master {
+            continue;
+        }
 
-        tokio::spawn(run_quorum_coordinator(2, event_rx, state_tx));
-
-        event_tx
-            .send(SwitchMasterEvent {
-                sentinel_id: (0),
-                new_addr: (dummy_ip2),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(*state_rx.borrow(), dummy_ip);
-
-        event_tx
-            .send(SwitchMasterEvent {
-                sentinel_id: (1),
-                new_addr: (dummy_ip2),
-            })
-            .await
-            .unwrap();
-
-        let result = tokio::time::timeout(Duration::from_secs(1), state_rx.changed()).await;
-
-        assert!(result.is_ok(), "Coordinator failed to update state in time");
-
-        assert_eq!(*state_rx.borrow(), dummy_ip2);
-    }
-
-    #[tokio::test]
-    async fn test_coordinator_unpauses_on_non_quorum_switch_master_ip() {
-        let dummy_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
-        let dummy_ip2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 6379);
-        let dummy_ip3 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 6379);
-
-        let (event_tx, event_rx) = mpsc::channel::<SwitchMasterEvent>(100);
-        let (state_tx, state_rx) = watch::channel(dummy_ip);
-
-        tokio::spawn(run_quorum_coordinator(2, event_rx, state_tx));
-
-        event_tx
-            .send(SwitchMasterEvent {
-                sentinel_id: (0),
-                new_addr: (dummy_ip2),
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(*state_rx.borrow(), dummy_ip);
-
-        event_tx
-            .send(SwitchMasterEvent {
-                sentinel_id: (1),
-                new_addr: (dummy_ip3),
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            !state_rx.has_changed().unwrap(),
-            "Coordinator should not have updated the state"
+        warn!(
+            current_proxy_target = %current_state.addr,
+            actual_quorum_master = %current_quorum_master,
+            "background poller detected master drift (missed pub/sub event)"
         );
 
-        assert_eq!(*state_rx.borrow(), dummy_ip);
+        for i in 0..sentinels.len() {
+            let event = SwitchMasterEvent {
+                sentinel_id: i,
+                new_addr: current_quorum_master,
+            };
+            match ctx
+                .run_until_cancelled(switch_event_sender.send(event))
+                .await
+            {
+                Some(Ok(())) => {}
+                Some(Err(_)) | None => return, // channel closed or ctx cancelled
+            }
+        }
     }
+}
+
+async fn resolve_master_by_quorum(
+    ctx: CancellationToken,
+    sentinels: &Vec<Arc<Sentinel>>,
+    master_name: String,
+    quorum_size: usize,
+) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
+    let mut tasks = JoinSet::new();
+
+    for (i, s) in sentinels.iter().enumerate() {
+        let ctx = ctx.clone();
+        let s = s.clone();
+        let master_name = master_name.clone();
+        tasks.spawn(async move { (i, query_sentinel_for_master(ctx, s, master_name).await) });
+    }
+
+    let mut master_votes: HashMap<SocketAddr, usize> = HashMap::new();
+
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            Ok((_, Ok(addr))) => {
+                let count = master_votes.entry(addr).or_insert(0);
+                *count += 1;
+                if *count >= quorum_size {
+                    return Ok(addr);
+                }
+            }
+            Ok((i, Err(e))) => {
+                debug!(sentinel = i, error = %e, "error getting master address");
+            }
+            Err(e) => {
+                error!(error = %e, "sentinel query task panicked");
+            }
+        }
+    }
+
+    Err("failed to reach quorum".into())
+}
+
+async fn query_sentinel_for_master(
+    ctx: CancellationToken,
+    sentinel: Arc<Sentinel>,
+    master_name: String,
+) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
+    let query = async {
+        let mut conn = sentinel.conn().await?;
+
+        let (ip, port): (String, u16) = redis::cmd("SENTINEL")
+            .arg("get-master-addr-by-name")
+            .arg(&master_name)
+            .query_async(&mut conn)
+            .await?;
+
+        let addr = SocketAddr::new(ip.parse::<IpAddr>()?, port);
+        return Ok(addr);
+    };
+
+    return tokio::time::timeout(Duration::from_millis(1_000), ctx.run_until_cancelled(query))
+        .await
+        .map_err(|_| format!("timeout running SENTINEL get-master-addr-by-name {master_name}"))?
+        .ok_or("context cancelled")?;
 }

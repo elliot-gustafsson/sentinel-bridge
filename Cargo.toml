@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = "0.1"
-fred = { version = "9.0", features = ["subscriber-client"] }
 tokio-util = "0.7"
 axum = "0.8.9"
 tracing = "0.1"
@@ -17,4 +16,7 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 metrics = "0.22"
 metrics-exporter-prometheus = "0.14"
-metrics-util = "0.16"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+redis = { version = "0.29", features = ["tokio-comp", "connection-manager"] }
+arc-swap = "1"
+humantime = "2.1"
