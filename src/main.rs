@@ -2,22 +2,23 @@ use arc_swap::{ArcSwap, ArcSwapAny};
 use axum::{Router, http::StatusCode, routing::get};
 use clap::Parser;
 use metrics::{Counter, Gauge, counter, describe_counter, describe_gauge, gauge};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
 use redis::RedisError;
-use redis::aio::{ConnectionManager, PubSub};
+use redis::aio::{ConnectionManager, ConnectionManagerConfig, PubSub};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::copy;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncWriteExt, BufReader, copy_buf};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{OnceCell, mpsc, mpsc::Receiver, mpsc::Sender};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -109,13 +110,36 @@ impl Sentinel {
     async fn conn(&self) -> Result<ConnectionManager, RedisError> {
         return self
             .conn
-            .get_or_try_init(|| self.client.get_connection_manager())
+            .get_or_try_init(|| {
+                let config = ConnectionManagerConfig::new()
+                    .set_connection_timeout(Duration::from_secs(1))
+                    .set_response_timeout(Duration::from_secs(3))
+                    .set_factor(2)
+                    .set_max_delay(1000)
+                    .set_number_of_retries(3)
+                    .set_tcp_settings(
+                        redis::io::tcp::TcpSettings::default()
+                            .set_user_timeout(Duration::from_secs(2)),
+                    );
+                self.client.get_connection_manager_with_config(config)
+            })
             .await
             .cloned();
     }
 
-    async fn pubsub(&self) -> Result<PubSub, RedisError> {
-        return self.client.get_async_pubsub().await;
+    async fn pubsub(&self, channels: &[&str]) -> Result<PubSub, RedisError> {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut pubsub = self.client.get_async_pubsub().await?;
+            pubsub.subscribe(channels).await?;
+            Ok(pubsub)
+        })
+        .await
+        .map_err(|_| {
+            RedisError::from(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pubsub connect/subscribe timed out",
+            ))
+        })?
     }
 }
 
@@ -218,7 +242,7 @@ async fn run(ctx: CancellationToken, config: Config) -> Result<(), Box<dyn std::
 
     info!("http server listening on {}", config.http_bind_addr);
 
-    let proxy_listener = TcpListener::bind(&config.proxy_bind_addr)
+    let proxy_listener = bind_proxy_listener(config.proxy_bind_addr.clone())
         .await
         .map_err(|e| {
             format!(
@@ -240,24 +264,7 @@ async fn run(ctx: CancellationToken, config: Config) -> Result<(), Box<dyn std::
     let run_ctx = CancellationToken::new();
     let _guard = run_ctx.clone().drop_guard();
 
-    let prom_handle = PrometheusBuilder::new().install_recorder()?;
-
-    describe_counter!(
-        "proxy_connections_total",
-        "Total number of connections opened to the backend"
-    );
-    describe_counter!(
-        "proxy_connections_closed_total",
-        "Total number of connections closed"
-    );
-    describe_counter!(
-        "proxy_backend_connection_errors_total",
-        "Total number of failed connection attempts to backend"
-    );
-    describe_gauge!(
-        "proxy_active_connections",
-        "Current number of active connections to the backend"
-    );
+    let prom_handle = setup_metrics(run_ctx.clone())?;
 
     tokio::spawn(run_http_server(
         run_ctx.clone(),
@@ -335,33 +342,31 @@ async fn run(ctx: CancellationToken, config: Config) -> Result<(), Box<dyn std::
     let ctx_clone = ctx.clone();
     let run_ctx_clone = run_ctx.clone();
 
-    let accept_task = tokio::spawn(async move {
-        let mut active_connections = JoinSet::new();
-        loop {
-            tokio::select! {
-                accept_result = proxy_listener.accept() => {
-                    let (client_stream, _) = match accept_result {
-                        Ok(val) => val,
-                        Err(e) => {
-                            error!(error = %e, "failed to accept connection");
-                            sleep(Duration::from_millis(10)).await;
-                            continue;
-                        }
-                    };
+    let tracker = TaskTracker::new();
+    let tracker_clone = tracker.clone();
 
-                    active_connections.spawn(handle_client_connection(
-                        ctx_clone.clone(),
-                        run_ctx_clone.clone(),
-                        backend_dialer,
-                        client_stream,
-                        state_pointer.clone(),
-                    ));
+    let accept_task = tokio::spawn(async move {
+        while let Some(accept_result) = accept_ctx_clone
+            .run_until_cancelled(proxy_listener.accept())
+            .await
+        {
+            let (client_stream, _) = match accept_result {
+                Ok(val) => val,
+                Err(e) => {
+                    error!(error = %e, "failed to accept connection");
+                    sleep(Duration::from_millis(10)).await;
+                    continue;
                 }
-                Some(_) = active_connections.join_next(), if !active_connections.is_empty() => {}
-                _ = accept_ctx_clone.cancelled() => break,
-            }
+            };
+
+            tracker_clone.spawn(handle_client_connection(
+                ctx_clone.clone(),
+                run_ctx_clone.clone(),
+                backend_dialer,
+                client_stream,
+                state_pointer.clone(),
+            ));
         }
-        active_connections
     });
 
     ctx.cancelled().await;
@@ -377,25 +382,69 @@ async fn run(ctx: CancellationToken, config: Config) -> Result<(), Box<dyn std::
 
     info!("starting shutdown...");
     accept_ctx.cancel();
-    let mut active_connections = accept_task.await?;
+    accept_task.await?;
+    tracker.close();
 
     info!("waiting for active connections to drain...");
-    if tokio::time::timeout(config.connection_drain_timeout, async {
-        while active_connections.join_next().await.is_some() {}
-    })
-    .await
-    .is_err()
+    if tokio::time::timeout(config.connection_drain_timeout, tracker.wait())
+        .await
+        .is_err()
     {
         warn!(
             timeout_ms = config.connection_drain_timeout.as_millis() as u64,
             "connection drain timeout reached, closing active connections..."
         );
         run_ctx.cancel();
-        while active_connections.join_next().await.is_some() {}
+        tracker.wait().await;
     }
 
     info!("shutting down, bye bye!");
     return Ok(());
+}
+
+fn setup_metrics(ctx: CancellationToken) -> Result<PrometheusHandle, BuildError> {
+    let prom_handle = PrometheusBuilder::new().install_recorder()?;
+
+    describe_counter!(
+        "proxy_connections_total",
+        "Total number of connections opened to the backend"
+    );
+    describe_counter!(
+        "proxy_connections_closed_total",
+        "Total number of connections closed"
+    );
+    describe_counter!(
+        "proxy_backend_connection_errors_total",
+        "Total number of failed connection attempts to backend"
+    );
+    describe_gauge!(
+        "proxy_active_connections",
+        "Current number of active connections to the backend"
+    );
+
+    let upkeep_handle = prom_handle.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.tick().await;
+        while ctx.run_until_cancelled(ticker.tick()).await.is_some() {
+            upkeep_handle.run_upkeep();
+        }
+    });
+
+    return Ok(prom_handle);
+}
+
+async fn bind_proxy_listener(bind_addr: String) -> Result<TcpListener, Box<dyn std::error::Error>> {
+    let proxy_addr: SocketAddr = bind_addr.parse()?;
+    let socket = if proxy_addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(proxy_addr)?;
+    let proxy_listener = socket.listen(4096)?; // Set accept queue to 4096 instead of default 128
+    return Ok(proxy_listener);
 }
 
 async fn run_http_server(
@@ -452,29 +501,48 @@ async fn handle_client_connection(
     metrics.connections_total.increment(1);
     metrics.active_connections.increment(1.0);
 
-    let (mut client_read, mut client_write) = client_stream.split();
-    let (mut backend_read, mut backend_write) = backend_stream.split();
+    let (client_read, mut client_write) = client_stream.split();
+    let (backend_read, mut backend_write) = backend_stream.split();
+
+    let mut client_read = BufReader::with_capacity(2048, client_read);
+    let mut backend_read = BufReader::with_capacity(4096, backend_read);
+
+    let mut client_to_backend = std::pin::pin!(async {
+        let _ = copy_buf(&mut client_read, &mut backend_write).await;
+        let _ = backend_write.shutdown().await;
+    });
+
+    let mut backend_to_client = std::pin::pin!(async {
+        let _ = copy_buf(&mut backend_read, &mut client_write).await;
+        let _ = client_write.shutdown().await;
+    });
 
     tokio::select! {
-        _ = copy(&mut client_read, &mut backend_write) => {
-            if ctx.is_cancelled() {
-                metrics.closed_graceful.increment(1);
-            } else {
-                metrics.closed_client_disconnect.increment(1);
-            }
-        }
-        _ = copy(&mut backend_read, &mut client_write) => {
-            if ctx.is_cancelled() {
-                metrics.closed_graceful.increment(1);
-            } else {
-                metrics.closed_server_disconnect.increment(1);
-            }
-        }
         _ = current_state.ctx.cancelled() => {
             metrics.closed_severed.increment(1);
         }
         _ = run_ctx.cancelled() => {
             metrics.closed_severed.increment(1);
+        }
+        backend_exit = async {
+            tokio::select! {
+                _ = &mut client_to_backend => {
+                    backend_to_client.await;
+                    false
+                }
+                _ = &mut backend_to_client => {
+                    client_to_backend.await;
+                    true
+                }
+            }
+        } => {
+            if ctx.is_cancelled() {
+                metrics.closed_graceful.increment(1);
+            } else if backend_exit {
+                metrics.closed_server_disconnect.increment(1);
+            } else {
+                metrics.closed_client_disconnect.increment(1);
+            }
         }
     }
 
@@ -549,7 +617,7 @@ async fn run_sentinel_subscriber(
     let mut backoff = DEFAULT_BACKOFF;
 
     loop {
-        let mut pubsub = match sentinel.pubsub().await {
+        let pubsub = match sentinel.pubsub(&["+new-epoch", "+switch-master"]).await {
             Ok(x) => x,
             Err(e) => {
                 error!(sentinel = id, error = %e, "error creating pubsub connection");
@@ -562,24 +630,24 @@ async fn run_sentinel_subscriber(
             }
         };
 
-        if let Err(e) = pubsub.subscribe(&["+new-epoch", "+switch-master"]).await {
-            error!(sentinel = id, error = %e, "error subscribing to sentinel channels");
-            tokio::select! {
-                _ = sleep(backoff) => {}
-                _ = ctx.cancelled() => return,
-            }
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-            continue;
-        };
-
         let start_time = tokio::time::Instant::now();
-        let mut stream = pubsub.into_on_message();
+        let (mut sink, mut stream) = pubsub.split();
+        let mut ping_ticker = tokio::time::interval(Duration::from_secs(5));
+        ping_ticker.tick().await;
 
         loop {
-            let msg = match ctx.run_until_cancelled(stream.next()).await {
-                Some(Some(m)) => m,
-                Some(None) => break, // stream disconnected
-                None => return,      // ctx cancelled
+            let msg = tokio::select! {
+                _ = ctx.cancelled() => return,
+                _ = ping_ticker.tick() => {
+                    match tokio::time::timeout(Duration::from_secs(1), sink.ping::<()>()).await {
+                        Ok(Ok(())) => continue,
+                        Ok(Err(_)) | Err(_) => break, // connection dead, reconnect
+                    }
+                }
+                maybe_msg = stream.next() => match maybe_msg {
+                    Some(m) => m,
+                    None => break, // stream disconnected
+                },
             };
 
             let Ok(payload) = msg.get_payload::<String>() else {
@@ -713,7 +781,7 @@ async fn run_reconciliation_loop(
 
 async fn resolve_master_by_quorum(
     ctx: CancellationToken,
-    sentinels: &Vec<Arc<Sentinel>>,
+    sentinels: &[Arc<Sentinel>],
     master_name: String,
     quorum_size: usize,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
@@ -734,6 +802,7 @@ async fn resolve_master_by_quorum(
                 let count = master_votes.entry(addr).or_insert(0);
                 *count += 1;
                 if *count >= quorum_size {
+                    tasks.detach_all();
                     return Ok(addr);
                 }
             }
@@ -767,8 +836,8 @@ async fn query_sentinel_for_master(
         return Ok(addr);
     };
 
-    return tokio::time::timeout(Duration::from_millis(1_000), ctx.run_until_cancelled(query))
+    return ctx
+        .run_until_cancelled(query)
         .await
-        .map_err(|_| format!("timeout running SENTINEL get-master-addr-by-name {master_name}"))?
         .ok_or("context cancelled")?;
 }
